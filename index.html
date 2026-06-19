@@ -1360,6 +1360,13 @@
 
 const TARGETS = { cal: 1800, prot: 130, carb: 170, fat: 58, fib: 30 };
 
+// ── Supabase (recipe library) ──────────────────────────────────
+// Publishable (anon) key — read-only access to `ready` recipes via RLS.
+const SUPABASE_URL = 'https://jsxcctrskkkxgdxfaduo.supabase.co';
+const SUPABASE_KEY = 'sb_publishable_P_YT241rOYj716f3Wgu4SA_bc2dpA_D';
+function supabaseHeaders() { return { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}` }; }
+let recipeLibraryCache = null;  // all `ready` recipes, fetched once per session
+
 // Default meal containers. Configurable in a later phase (schema already supports it).
 const DEFAULT_MEALS = [
   { id: 'breakfast', label: 'breakfast' },
@@ -1498,86 +1505,58 @@ function isForecast(entry) {
 }
 
 // ═══════════════════════════════════════════════
-// SUPABASE QUERY via Claude API  (unchanged intelligence)
+// SUPABASE RECIPE LIBRARY  (direct PostgREST, read-only)
 // ═══════════════════════════════════════════════
-async function querySupabase(mealType, searchTerms) {
-  const keywords = searchTerms.toLowerCase()
+
+// Expand the user's shorthand into search keywords.
+function recipeKeywords(searchTerms) {
+  return searchTerms.toLowerCase()
     .replace(/\bewo\b/g, 'egg white oats protein')
     .replace(/\bpb\b/g, 'peanut butter')
     .split(/[\s,&\/\-]+/)
     .filter(w => w.length > 2)
     .slice(0, 5);
+}
 
-  const conditions = keywords.map(k => `name ILIKE '%${k.replace(/'/g,"''")}%'`).join(' OR ');
-  const mealTypes = mealType === 'snack'
-    ? `meal_type IN ('snack','dessert')`
-    : mealType === 'dessert'
-    ? `meal_type = 'dessert'`
-    : `(meal_type = '${mealType}' OR '${mealType}' = ANY(meal_types))`;
+// PostgREST `or(...)` group matching a meal type against meal_type + meal_types[].
+function mealTypeFilter(mealType) {
+  const types = mealType === 'snack' ? ['snack','dessert'] : [mealType];
+  const parts = [];
+  for (const t of types) { parts.push(`meal_type.eq.${t}`, `meal_types.cs.{${t}}`); }
+  return `or(${parts.join(',')})`;
+}
 
-  const sql = `
-    SELECT id, name, meal_type, calories, protein_g, carbs_g, fat_g, fibre_g, sugar_g, gi_estimate,
-           serves, ingredient_sections, import_status, review_flags, notes
-    FROM recipes
-    WHERE import_status IN ('ready','review')
-    AND is_hidden IS NOT TRUE
-    AND (${mealTypes})
-    AND (${conditions || "name ILIKE '%' || '" + (keywords[0]||'') + "' || '%'"})
-    ORDER BY name LIMIT 8;`;
-
-  const prompt = `You are a Supabase query executor for a nutrition app. Execute this SQL against the Supabase project ID jsxcctrskkkxgdxfaduo and return the raw JSON result array only, no explanation, no markdown:\n\n${sql}`;
-
+// Search the recipe library directly via the Supabase REST API.
+// Returns up to 8 matching `ready` recipes (RLS restricts anon to `ready`).
+async function querySupabase(mealType, searchTerms) {
+  const keywords = recipeKeywords(searchTerms);
+  const groups = [mealTypeFilter(mealType)];
+  if (keywords.length) {
+    const nameOr = keywords.map(k => `name.ilike.*${encodeURIComponent(k)}*`).join(',');
+    groups.push(`or(${nameOr})`);
+  }
+  const select = 'id,name,meal_type,meal_types,calories,protein_g,carbs_g,fat_g,fibre_g,sugar_g,gi_estimate,serves,import_status,notes';
+  const url = `${SUPABASE_URL}/rest/v1/recipes`
+    + `?select=${select}&import_status=eq.ready`
+    + `&and=(${groups.join(',')})&order=name&limit=8`;
   try {
-    const resp = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        model: 'claude-sonnet-4-6', max_tokens: 1000,
-        mcp_servers: [{ type:'url', url:'https://mcp.supabase.com/mcp', name:'supabase' }],
-        messages: [{ role:'user', content: prompt }]
-      })
-    });
+    const resp = await fetch(url, { headers: supabaseHeaders() });
+    if (!resp.ok) return [];
     const data = await resp.json();
-    let resultText = '';
-    for (const block of (data.content || [])) {
-      if (block.type === 'mcp_tool_result' && block.content?.[0]?.text) { resultText = block.content[0].text; break; }
-      if (block.type === 'text' && block.text) resultText = block.text;
-    }
-    const clean = resultText.replace(/```json|```/g,'').trim();
-    const parsed = JSON.parse(clean);
-    return Array.isArray(parsed) ? parsed : (parsed.result || parsed.rows || []);
+    return Array.isArray(data) ? data : [];
   } catch(e) { return []; }
 }
 
-async function estimateNutrition(recipe) {
-  if (!recipe.ingredient_sections) return null;
-  const prompt = `You are a nutrition estimator. Given these recipe ingredients, estimate per-serving macros.
-Recipe: ${recipe.name} (makes ${recipe.serves} servings)
-Ingredients: ${JSON.stringify(recipe.ingredient_sections)}
-The user is gluten-free (coeliac) and dairy-free. Reply ONLY with JSON:
-{"calories": number, "protein_g": number, "carbs_g": number, "fat_g": number, "fibre_g": number}
-No text, no markdown.`;
+// Fetch every `ready` recipe once and cache for the browse picker.
+async function fetchAllRecipes() {
+  if (recipeLibraryCache) return recipeLibraryCache;
+  const select = 'id,name,meal_type,meal_types,protein_source,cuisine,tags,craving_tags,calories,protein_g,carbs_g,fat_g,fibre_g,gi_estimate,serves';
+  const url = `${SUPABASE_URL}/rest/v1/recipes?select=${select}&import_status=eq.ready&order=name`;
   try {
-    const resp = await fetch('https://api.anthropic.com/v1/messages', {
-      method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({ model:'claude-sonnet-4-6', max_tokens:200, messages:[{role:'user',content:prompt}] })
-    });
-    const data = await resp.json();
-    const text = (data.content?.[0]?.text || '').replace(/```json|```/g,'').trim();
-    return JSON.parse(text);
-  } catch(e){ return null; }
-}
-
-async function pushNutritionToSupabase(id, n) {
-  const sql = `UPDATE recipes SET calories=${n.calories}, protein_g=${n.protein_g}, carbs_g=${n.carbs_g}, fat_g=${n.fat_g}, fibre_g=${n.fibre_g}, review_flags=array_append(COALESCE(review_flags,ARRAY[]::text[]),'nutrition_estimated'), updated_at=NOW() WHERE id='${id}';`;
-  const prompt = `Execute this SQL on Supabase project jsxcctrskkkxgdxfaduo: ${sql} Return only "ok" when done.`;
-  try {
-    await fetch('https://api.anthropic.com/v1/messages', {
-      method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({ model:'claude-sonnet-4-6', max_tokens:100,
-        mcp_servers:[{type:'url',url:'https://mcp.supabase.com/mcp',name:'supabase'}],
-        messages:[{role:'user',content:prompt}] })
-    });
-  } catch(e){}
+    const resp = await fetch(url, { headers: supabaseHeaders() });
+    recipeLibraryCache = resp.ok ? (await resp.json()) : [];
+  } catch(e) { recipeLibraryCache = []; }
+  return recipeLibraryCache;
 }
 
 // ═══════════════════════════════════════════════
@@ -1649,17 +1628,11 @@ async function processMatchQueue() {
 }
 
 async function finaliseRecipeMatch(recipe, entry, serves) {
-  let r = recipe, estimated = false;
-  if (!r.calories || !r.protein_g) {
-    setLoading(true, `Estimating nutrition for "${r.name}"…`);
-    const est = await estimateNutrition(r);
-    setLoading(false);
-    if (est) { r = { ...r, ...est }; estimated = true;
-      toast(`Nutrition estimated for ${r.name} — pushed to Supabase`, 'warn');
-      pushNutritionToSupabase(r.id, est);
-    }
-  }
-  for (let i=0;i<entry.repeat;i++) addRecipeEntry(entry.type, r, serves, false, estimated);
+  // Recipes carry their own macros from the library. Flag (but don't fabricate)
+  // when a row is missing nutrition so it's visibly marked as estimated.
+  const estimated = !(recipe.calories && recipe.protein_g);
+  if (estimated) toast(`${recipe.name} has no saved macros — logged without them`, 'warn');
+  for (let i=0;i<entry.repeat;i++) addRecipeEntry(entry.type, recipe, serves, false, estimated);
 }
 
 function scoreMatch(query, name) {
@@ -2144,6 +2117,10 @@ function renderAddChooser() {
     <h3>Add to your day</h3>
     <div class="modal-sub">Logged straight into the diary — counts immediately.</div>
     <div class="action-grid">
+      <button class="action-tile" onclick="renderRecipeLibrary()">
+        <span class="action-tile-icon">📖</span>
+        <span class="action-tile-text"><span class="action-tile-title">Recipe library</span><span class="action-tile-desc">Search your saved recipes & add</span></span>
+      </button>
       <button class="action-tile" onclick="renderManualFoodForm()">
         <span class="action-tile-icon">🍳</span>
         <span class="action-tile-text"><span class="action-tile-title">Add food</span><span class="action-tile-desc">Name it with full macros</span></span>
@@ -2171,6 +2148,69 @@ function renderAddChooser() {
           </div>`).join('')}
       </div>` : ''}
   `;
+}
+
+// ── Recipe library browse picker ────────────────────────────────
+async function renderRecipeLibrary() {
+  const body = document.getElementById('addModalBody');
+  body.innerHTML = `
+    <h3>Recipe library</h3>
+    <div class="modal-sub">Search your Daily Shuffle recipes — tap one to log it.</div>
+    <div class="field-group"><label class="field-label">Meal</label>${mealSelectHtml(addFlowMealId)}</div>
+    <div class="field-group">
+      <input class="field-input" id="libSearch" placeholder="Search by name, e.g. bang bang chicken…" oninput="filterRecipeLibrary()" autocomplete="off">
+    </div>
+    <div class="recent-list" id="libList" style="max-height:46vh">
+      <div class="meal-empty-hint">Loading your recipes…</div>
+    </div>
+    <div class="modal-actions">
+      <button class="btn btn-secondary btn-sm" onclick="renderAddChooser()">Back</button>
+    </div>`;
+  const search = document.getElementById('libSearch');
+  if (search) search.focus();
+  await fetchAllRecipes();
+  filterRecipeLibrary();
+}
+
+function filterRecipeLibrary() {
+  const listEl = document.getElementById('libList');
+  if (!listEl) return;
+  const term = (document.getElementById('libSearch')?.value || '').toLowerCase().trim();
+  const all = recipeLibraryCache || [];
+  const matches = !term ? all : all.filter(r => {
+    const hay = [r.name, r.protein_source, r.cuisine,
+                 (r.tags||[]).join(' '), (r.craving_tags||[]).join(' ')]
+                .join(' ').toLowerCase();
+    return term.split(/\s+/).every(w => hay.includes(w));
+  });
+  if (!matches.length) {
+    listEl.innerHTML = `<div class="meal-empty-hint">${all.length ? 'No recipes match that search.' : 'Could not load recipes — check your connection.'}</div>`;
+    return;
+  }
+  listEl.innerHTML = matches.slice(0, 60).map(r => `
+    <div class="recent-item" onclick="pickLibraryRecipe('${r.id}')">
+      <div style="flex:1;min-width:0">
+        <div class="recent-item-name">${r.name}</div>
+        <div class="match-item-sub">${r.meal_type || (r.meal_types||[])[0] || '—'} · ${r.serves || 1} serving(s)</div>
+      </div>
+      <span class="recent-item-macros">${Math.round(r.protein_g||0)}P · ${Math.round(r.calories||0)} kcal</span>
+    </div>`).join('') +
+    (matches.length > 60 ? `<div class="meal-empty-hint">Showing first 60 of ${matches.length} — keep typing to narrow.</div>` : '');
+}
+
+function pickLibraryRecipe(id) {
+  const recipe = (recipeLibraryCache || []).find(r => String(r.id) === String(id));
+  if (!recipe) return;
+  const mealId = document.getElementById('addMealSelect')?.value || addFlowMealId;
+  addFlowMealId = mealId;
+  closeAddFlow();
+  const estimated = !(recipe.calories && recipe.protein_g);
+  showServesPrompt(recipe, mealId, (serves) => {
+    addRecipeEntry(mealId, recipe, serves, true, estimated);  // confirmed → counts immediately
+    addFlowMealId = null;
+    renderAll();
+    toast(`${recipe.name} added`, 'success');
+  });
 }
 
 function renderManualFoodForm() {
